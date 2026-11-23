@@ -1,0 +1,110 @@
+name: CI/CD – FitBook mini
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: fitbook-mini
+
+jobs:
+  # 1. szakasz: build + egység- és integrációs tesztek
+  test:
+    name: Build és teszt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Függőségek telepítése
+        run: pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Tesztek futtatása lefedettséggel
+        run: pytest -v --cov=app --cov-report=term --cov-fail-under=80 --junitxml=test-results.xml
+
+      - name: Tesztriport mentése
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: test-results.xml
+
+  # 2. szakasz: Docker image (artifact) elkészítése és feltöltése a GitHub Container Registrybe
+  package:
+    name: Docker image build és push
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image név összeállítása (kisbetűs tulajdonosnév)
+        id: vars
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}:${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Bejelentkezés a GHCR-be
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build és push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          build-args: APP_VERSION=${{ github.sha }}
+          tags: ${{ steps.vars.outputs.image }}
+
+  # 3. szakasz: telepítés a sandbox környezetbe + ellenőrzés (Definition of Done)
+  deploy:
+    name: Deploy a sandboxba és smoke teszt
+    needs: package
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: sandbox
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bejelentkezés a GHCR-be
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: A registryben lévő artifact telepítése és indítása
+        run: |
+          docker pull ${{ needs.package.outputs.image }}
+          docker run -d --name fitbook -p 8000:8000 ${{ needs.package.outputs.image }}
+
+      - name: Smoke teszt a futó alkalmazáson
+        run: |
+          chmod +x scripts/smoke_test.sh
+          ./scripts/smoke_test.sh http://localhost:8000
+
+      - name: Konténer állapota és naplója
+        if: always()
+        run: |
+          docker ps -a
+          docker logs fitbook
+
+      - name: Összefoglaló
+        run: |
+          echo "### Telepítés sikeres :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "Image: \`${{ needs.package.outputs.image }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Health: \`$(curl -s http://localhost:8000/health)\`" >> "$GITHUB_STEP_SUMMARY"
